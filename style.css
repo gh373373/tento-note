@@ -167,3 +167,7 @@ textarea{min-height:70px;resize:vertical}
 .ship-sum div{display:flex;justify-content:space-between;gap:10px;border-bottom:1px solid var(--line);padding:6px 0}
 .ship-sum div:last-child{border-bottom:0}
 @media (prefers-reduced-motion:no-preference){.sheet{animation:up .18s ease-out}@keyframes up{from{transform:translateY(16px);opacity:.6}}}
+
+.name-chip{display:inline-flex;align-items:stretch}
+.choice .name-chip button[data-pick]{border-radius:999px 0 0 999px;border-right:0}
+.choice .name-chip .unpick{border-radius:0 999px 999px 0;padding:9px 12px;color:var(--muted);font-weight:700}

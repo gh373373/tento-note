@@ -504,6 +504,7 @@ document.addEventListener("click", async ev => {
   if(b.dataset.filter){ filter = b.dataset.filter; render(); return; }
   if(b.dataset.open){ openSheet({kind:"detail", id:b.dataset.open}); return; }
   if(b.id === "whoBtn"){ askName(); return; }
+  if(b.dataset.unpick){ const n=b.dataset.unpick; store.set("gh.names", store.get("gh.names",[]).filter(x=>x!==n)); if(me===n){ me=""; store.set("gh.name",""); } const then=sheetState&&sheetState.then; askName(then); toast(`「${n}」を消しました`); return; }
   if(b.dataset.pick && sheetState && sheetState.done){ sheetState.done(b.dataset.pick); return; }
   if(b.hasAttribute("data-back")){
     if(b.dataset.back==="detail" && sheetState && sheetState.id){ openSheet({kind:"detail", id:sheetState.id}); }
@@ -568,14 +569,15 @@ function askName(then){
   $("#sheet").innerHTML = `${head("担当者の名前")}
   <div class="sheet-body"><form class="wrap" id="nameForm">
     <p class="sub">記録に誰が操作したかを残すために使います。この端末に覚えておきます。</p>
-    ${names.length?`<div class="choice">${names.map(n=>`<button type="button" data-pick="${esc(n)}">${esc(n)}</button>`).join("")}</div>`:""}
+    ${names.length?`<div class="field"><span class="lbl">この端末で使った名前</span><div class="choice">${names.map(n=>`<span class="name-chip"><button type="button" data-pick="${esc(n)}">${esc(n)}</button><button type="button" class="unpick" data-unpick="${esc(n)}" aria-label="${esc(n)}を消す">×</button></span>`).join("")}</div>
+      <span class="hint">辞めた人の名前は「×」で消せます。これまでの記録に残った名前は消えません。</span></div>`:""}
     <div class="field"><label for="nameIn">名前</label><input id="nameIn" type="text" value="${esc(me)}" placeholder="例：山田" required></div>
     <button class="submit" type="submit">これで始める</button>
     ${mode==="shared"?`<div class="box"><h4>この端末の設定</h4>
       <label class="file-btn">データを取り込む（JSON）<input type="file" id="importIn" accept="application/json,.json"></label>
       <button type="button" class="danger-link" id="logoutBtn">この端末からログアウト</button></div>`:""}</form></div>`;
   const done = n => { me = n; store.set("gh.name", n); store.set("gh.names", [...new Set([n, ...names])].slice(0,8)); closeSheet(); render(); if(then) then(); };
-  sheetState.done = done;
+  sheetState.done = done; sheetState.then = then;
 }
 
 boot();
