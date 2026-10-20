@@ -8,5 +8,6 @@ service cloud.firestore {
     }
     match /lots/{id} { allow read, write: if isStaff(); }
     match /photos/{id} { allow read, write: if isStaff(); }
+    match /sales/{id} { allow read, write: if isStaff(); }
   }
 }

@@ -56,7 +56,7 @@ function localSample(){
 async function boot(){
   render();
   if(!configured){
-    mode = "local";
+    mode = "local"; sales = store.get(SALES_KEY, []);
     lots = store.get(LOCAL_KEY, null) || localSample();
     showBanner("設定前のお試しモードです。記録はこの端末だけに保存されます。");
     render(); return;
@@ -73,7 +73,7 @@ async function boot(){
     fb.onAuthStateChanged(auth, user => {
       if(unsubLots){ unsubLots(); unsubLots = null; }
       if(!user){ mode = "login"; lots = {}; closeSheet(); render(); return; }
-      mode = "shared"; render();
+      mode = "shared"; salesFrom = null; ensureSales(); render();
       unsubLots = fb.onSnapshot(fb.collection(fdb, "lots"), snap => {
         const next = {}; snap.forEach(d => { next[d.id] = d.data(); });
         lots = next; render(); if(sheetState) renderSheet();
@@ -81,7 +81,7 @@ async function boot(){
       }, err => { showBanner("データを読み込めません。暗証番号でもう一度ログインしてください。"); });
     });
   }catch(e){
-    mode = "local"; lots = store.get(LOCAL_KEY, null) || {};
+    mode = "local"; lots = store.get(LOCAL_KEY, null) || {}; sales = store.get(SALES_KEY, []);
     showBanner("通信できないため、この端末だけで動いています。電波のよい所で開き直してください。"); render();
   }
 }
@@ -113,6 +113,39 @@ async function removeLot(id){
   render();
 }
 function newId(){ return mode==="shared" ? fb.doc(fb.collection(fdb, "lots")).id : "l"+Date.now().toString(36); }
+
+
+/* ---------- 売上の記録（消えない明細。商品を消しても残る） ---------- */
+let sales = [], salesLoading = false, unsubSales = null;
+const SALES_KEY = "gh.local.sales";
+function saleRecord(id, l, e){
+  const price = e.price ?? l.price ?? null;
+  return {t:e.t, date:ymd(new Date(e.t)), lotId:id, name:l.name, kind:l.kind, unit:l.unit,
+    type:e.type, channel: e.type==="ship" ? e.dest : "直売所", qty:e.qty, price, amount: price==null ? null : e.qty*price, by:e.by||""};
+}
+function recordSale(rec){
+  if(mode === "shared"){
+    fb.setDoc(fb.doc(fb.collection(fdb, "sales")), rec).catch(e => toast(e && e.code==="permission-denied" ? "売上を保存できません。Firestore のルールを更新してください" : "売上を保存できませんでした"));
+  }else{
+    sales.push(rec); store.set(SALES_KEY, sales);
+  }
+}
+function subscribeSales(from){
+  if(mode !== "shared") return;
+  if(unsubSales) unsubSales();
+  salesLoading = true;
+  unsubSales = fb.onSnapshot(fb.query(fb.collection(fdb, "sales"), fb.where("date", ">=", from)), snap => {
+    const next = []; snap.forEach(d => next.push(d.data())); sales = next; salesLoading = false;
+    if(tab === "ship") render();
+  }, () => { salesLoading = false; if(tab === "ship") render(); });
+}
+let salesFrom = null;
+function ensureSales(){
+  if(mode !== "shared") return;
+  const from = periodRange().from;
+  if(salesFrom && salesFrom <= from) return;
+  salesFrom = from; subscribeSales(from);
+}
 
 /* 写真：縮小して保存。一覧用の小さい写真は商品データに、大きい写真は photos に */
 async function shrink(file, max){
@@ -198,7 +231,7 @@ function render(){
   if(mode === "login"){ v.innerHTML = viewLogin(); return; }
   if(tab === "today") v.innerHTML = viewToday();
   else if(tab === "stock") v.innerHTML = viewStock();
-  else if(tab === "ship") v.innerHTML = viewShip();
+  else if(tab === "ship"){ ensureSales(); v.innerHTML = viewSales(); }
   else if(tab === "new"){ v.innerHTML = viewToday(); }
 }
 function viewLogin(){
@@ -236,23 +269,58 @@ function viewStock(){
     <div class="tiles num"><div class="tile"><b>${all.length}</b><span>品目</span></div><div class="tile"><b>${sum("shelf")}</b><span>店頭</span></div><div class="tile"><b>${sum("stock")}</b><span>畑・ハウス在庫</span></div></div>
     <div class="list">${all.length ? all.map(cardHTML).join("") : `<div class="empty">該当する商品はありません。</div>`}</div>`;
 }
-function viewShip(){
-  const since = Date.now() - 7*86400000;
-  const totals = {}, money = {};
-  Object.values(lots).forEach(l => (l.log||[]).forEach(e => {
-    if(new Date(e.t).getTime() < since) return;
-    const key = e.type==="ship" ? e.dest : e.type==="sell" ? "直売所（販売）" : null; if(!key) return;
-    totals[key] = totals[key] || []; totals[key].push(`${l.name} ${e.qty}${l.unit}`);
-    money[key] = (money[key]||0) + amt(e,l);
-  }));
-  const dest = Object.keys(totals);
+let salesPeriod = "month", pickMonth = "";
+function periodRange(){
+  const t = today();
+  if(salesPeriod==="today") return {from:t, to:t, label:"今日"};
+  if(salesPeriod==="week") return {from:addDays(t,-6), to:t, label:"この7日間"};
+  if(salesPeriod==="month") return {from:t.slice(0,7)+"-01", to:t, label:"今月"};
+  if(salesPeriod==="last"){ const d=new Date(t.slice(0,7)+"-01T00:00:00"); d.setDate(0); const m=ymd(d).slice(0,7); return {from:m+"-01", to:ymd(d), label:"先月"}; }
+  const m = pickMonth || t.slice(0,7); const e = new Date(m+"-01T00:00:00"); e.setMonth(e.getMonth()+1); e.setDate(0);
+  return {from:m+"-01", to:ymd(e), label:`${Number(m.slice(5))}月`};
+}
+function salesInRange(){ const r = periodRange(); return {r, rows: sales.filter(x => x.date >= r.from && x.date <= r.to)}; }
+function viewSales(){
+  const {r, rows} = salesInRange();
+  const sum = (arr) => arr.reduce((a,x)=>a+(x.amount||0),0);
+  const byCh = {}, byItem = {};
+  rows.forEach(x => {
+    const c = byCh[x.channel] = byCh[x.channel] || {yen:0, n:0, units:{}};
+    c.yen += x.amount||0; c.n++; c.units[x.unit] = (c.units[x.unit]||0) + x.qty;
+    const k = x.name+"｜"+x.unit, it = byItem[k] = byItem[k] || {name:x.name, unit:x.unit, kind:x.kind, qty:0, yen:0, direct:0};
+    it.qty += x.qty; it.yen += x.amount||0; if(x.type==="sell") it.direct += x.qty;
+  });
+  const direct = rows.filter(x=>x.type==="sell"), ship = rows.filter(x=>x.type==="ship");
+  const unitsTxt = u => Object.entries(u).map(([k,v])=>`${v}${k}`).join("・");
   const routeCard = (k) => `<div class="rule-card"><h3><span class="kind ${k}">${KIND_LABEL[k]}</span>の出荷順</h3>
     <div class="route">${ROUTES[k].map((names,i)=>`<div class="route-step"><span class="n">${i+1}</span><span>${names.join("・")}</span><span class="q">${i===0?"まずはここで":i===ROUTES[k].length-1?"最後の受け皿":"余りそうなら"}</span></div>`).join("")}</div></div>`;
+  const items = Object.values(byItem).sort((a,b)=>b.yen-a.yen || b.qty-a.qty);
   return `
+    <div><h2>売上と販売数量</h2><p class="sub">「売れた」「店頭チェック」「出荷する」で記録した分を集計しています。</p></div>
+    <div class="seg" role="group" aria-label="期間">
+      ${[["today","今日"],["week","7日間"],["month","今月"],["last","先月"],["pick","月を選ぶ"]].map(([k,t])=>`<button type="button" data-period="${k}" aria-pressed="${salesPeriod===k}">${t}</button>`).join("")}
+    </div>
+    ${salesPeriod==="pick"?`<div class="field"><label for="monthIn">集計する月</label><input id="monthIn" type="month" value="${esc(pickMonth||today().slice(0,7))}"></div>`:""}
+    <p class="sub num">${esc(r.label)}：${mdj(r.from)}〜${mdj(r.to)}${salesLoading?"（読み込み中…）":""}</p>
+    <div class="tiles num">
+      <div class="tile"><b style="font-size:20px">${yen(sum(rows))}</b><span>売上の合計</span></div>
+      <div class="tile"><b style="font-size:20px">${yen(sum(direct))}</b><span>直売所</span></div>
+      <div class="tile"><b style="font-size:20px">${yen(sum(ship))}</b><span>出荷先</span></div>
+    </div>
+    <div class="box"><h4>販売先ごと</h4>${Object.keys(byCh).length ? `<div class="ship-sum">${Object.entries(byCh).sort((a,b)=>b[1].yen-a[1].yen).map(([c,v])=>`<div><strong>${esc(c)}</strong><span class="num" style="text-align:right">${yen(v.yen)}<br><small class="sub">${esc(unitsTxt(v.units))}</small></span></div>`).join("")}</div>` : `<p class="sub">この期間の販売記録はありません。</p>`}</div>
+    <div class="box"><h4>品目ごと</h4>${items.length ? `<div class="ship-sum">${items.map(it=>`<div><strong><span class="kind ${it.kind}">${KIND_LABEL[it.kind]||""}</span> ${esc(it.name)}</strong><span class="num" style="text-align:right">${it.qty}${esc(it.unit)}　${yen(it.yen)}<br><small class="sub">うち直売 ${it.direct}${esc(it.unit)}</small></span></div>`).join("")}</div>` : `<p class="sub">この期間の販売記録はありません。</p>`}</div>
+    ${rows.length ? `<button type="button" class="act wide" id="csvBtn">この期間の明細をCSVで保存<small>Excel で開けます（${rows.length}件）</small></button>` : ""}
     <div><h2>出荷先のルール</h2><p class="sub">店頭だけで売り切れないと判断したら、上から順に次の行き先へ回します。</p></div>
-    <div class="rules">${routeCard("nae")}${routeCard("yasai")}</div>
-    <div><h2>この7日間の行き先</h2></div>
-    <div class="box">${dest.length ? `<div class="ship-sum">${dest.map(d=>`<div><strong>${esc(d)}<br><span class="num" style="font-weight:400">${yen(money[d])}</span></strong><span style="text-align:right;color:var(--muted)">${esc(totals[d].slice(0,4).join("、"))}${totals[d].length>4?` ほか${totals[d].length-4}件`:""}</span></div>`).join("")}</div>` : `<p class="sub">まだ出荷・販売の記録がありません。</p>`}</div>`;
+    <div class="rules">${routeCard("nae")}${routeCard("yasai")}</div>`;
+}
+function downloadCSV(){
+  const {r, rows} = salesInRange();
+  const q = v => { const t = String(v ?? ""); return /[",\n]/.test(t) ? `"${t.replace(/"/g,'""')}"` : t; };
+  const head = ["日付","時刻","品名","種類","販売先","数量","単位","単価","金額","担当"];
+  const lines = rows.slice().sort((a,b)=>a.t<b.t?-1:1).map(x => [x.date, new Date(x.t).toTimeString().slice(0,5), x.name, KIND_LABEL[x.kind]||"", x.channel, x.qty, x.unit, x.price ?? "", x.amount ?? "", x.by].map(q).join(","));
+  const blob = new Blob(["﻿" + [head.join(","), ...lines].join("\r\n")], {type:"text/csv"});
+  const a = document.createElement("a"); a.href = URL.createObjectURL(blob); a.download = `sales_${r.from}_${r.to}.csv`;
+  document.body.appendChild(a); a.click(); setTimeout(()=>{ URL.revokeObjectURL(a.href); a.remove(); }, 1000);
 }
 
 /* ---------- シート（詳細・操作・登録） ---------- */
@@ -396,10 +464,11 @@ async function submitAction(s){
   if(s.act==="count"){
     const diff = (l.shelf||0) - q;
     if(s.photo){ e.mini = s.photo.mini; if(s.photo.photo) e.photo = s.photo.photo; l.photo = s.photo.photo; l.photoData = s.photo.photoData; }
-    if(diff > 0){ l.log.push({...stamp(), type:"sell", qty:diff, note:"店頭チェックで計算", ...(l.price!=null?{price:l.price}:{})}); }
+    if(diff > 0){ const se = {...stamp(), type:"sell", qty:diff, note:"店頭チェックで計算", ...(l.price!=null?{price:l.price}:{})}; l.log.push(se); recordSale(saleRecord(s.id, l, se)); }
     l.shelf = q;
   }
   l.log.push(e); l.updatedAt = e.t; l.updatedBy = e.by;
+  if(s.act==="sell" || s.act==="ship") recordSale(saleRecord(s.id, l, e));
   await saveLot(s.id, l);
   toast({sell:`${q}${unit} 売れたと記録しました`, restock:`${q}${unit} 店頭へ補充しました`, ship:`${s.dest} へ ${q}${unit} 出荷しました`, harvest:`${q}${unit} 在庫に足しました`, discard:`${q}${unit} の廃棄を記録しました`, count:`店頭 ${q}${unit} で保存しました`}[s.act]);
   return true;
@@ -430,6 +499,8 @@ document.addEventListener("click", async ev => {
     if(b.dataset.tab === "new"){ if(!me){ askName(()=>openSheet({kind:"edit", kindSel:"yasai"})); return; } openSheet({kind:"edit", kindSel:"yasai"}); return; }
     tab = b.dataset.tab; render(); window.scrollTo(0,0); return;
   }
+  if(b.dataset.period){ salesPeriod = b.dataset.period; render(); return; }
+  if(b.id==="csvBtn"){ downloadCSV(); return; }
   if(b.dataset.filter){ filter = b.dataset.filter; render(); return; }
   if(b.dataset.open){ openSheet({kind:"detail", id:b.dataset.open}); return; }
   if(b.id === "whoBtn"){ askName(); return; }
@@ -461,6 +532,7 @@ document.addEventListener("click", async ev => {
   if(b.id==="delYes"){ const id=s.id; closeSheet(); await removeLot(id); toast("削除しました"); return; }
 });
 document.addEventListener("change", async ev => {
+  if(ev.target.id === "monthIn"){ pickMonth = ev.target.value; render(); return; }
   if(ev.target.id === "importIn"){ const f=ev.target.files[0]; if(!f) return;
     try{ const data = JSON.parse(await f.text()); const items = Array.isArray(data) ? data : Object.entries(data).map(([id,v])=>({id, ...v}));
       let n=0; for(const it of items){ const {id, ...rest} = it; if(!id || !rest.name) continue; await saveLot(id, rest); n++; }
