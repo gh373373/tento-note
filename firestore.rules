@@ -1,0 +1,12 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // お店の共通アカウントでログインした端末だけが読み書きできる
+    // ↓ config.js の shopEmail と同じアドレスにしてください
+    function isStaff() {
+      return request.auth != null && request.auth.token.email == "staff@gardenhouse-farm.jp";
+    }
+    match /lots/{id} { allow read, write: if isStaff(); }
+    match /photos/{id} { allow read, write: if isStaff(); }
+  }
+}
