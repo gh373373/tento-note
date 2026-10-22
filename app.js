@@ -106,6 +106,41 @@ async function saveLot(id, data){
   }
   render();
 }
+/* 既存の商品は「差分」だけ送る。2台で同時に操作しても数が消えない（在庫・店頭は足し引き、記録は追加） */
+const EDIT_FIELDS = ["name","kind","unit","price","shelfLimit","memo","photo","photoData","stage"];
+async function patchLot(id, before, after, entries, opts={}){
+  const clean = JSON.parse(JSON.stringify(after));
+  lots[id] = clean;
+  if(mode !== "shared"){
+    if(clean.log && clean.log.length > LOG_MAX) clean.log = clean.log.slice(-LOG_MAX);
+    store.set(LOCAL_KEY, lots); render(); return;
+  }
+  const p = {updatedAt: clean.updatedAt, updatedBy: clean.updatedBy};
+  const dStock = (clean.stock||0) - (before.stock||0);
+  if(opts.absStock) p.stock = clean.stock || 0;
+  else if(dStock) p.stock = fb.increment(dStock);
+  if(opts.absShelf) p.shelf = clean.shelf;
+  else { const dShelf = (clean.shelf||0) - (before.shelf||0); if(dShelf) p.shelf = fb.increment(dShelf); }
+  EDIT_FIELDS.forEach(k => { if(JSON.stringify(clean[k] ?? null) !== JSON.stringify(before[k] ?? null)) p[k] = clean[k] ?? null; });
+  const sp = clean.shipPrices || {}, bp = before.shipPrices || {};
+  const args = [];
+  Object.keys(sp).forEach(d => { if(sp[d] !== bp[d]) args.push(new fb.FieldPath("shipPrices", d), sp[d]); });
+  if(entries.length) p.log = fb.arrayUnion(...JSON.parse(JSON.stringify(entries)));
+  const ref = fb.doc(fdb, "lots", id);
+  // 出荷先ごとの卸値はキーに「・」などが入るので FieldPath で指定する（その場合は全部を「名前, 値」の並びで渡す）
+  const call = args.length ? fb.updateDoc(ref, ...Object.entries(p).flat(), ...args) : fb.updateDoc(ref, p);
+  call.catch(e => toast(e && e.code==="permission-denied" ? "保存する権限がありません。ログインし直してください" : e && e.code==="not-found" ? "この商品は別の端末で削除されています" : "保存できませんでした。もう一度試してください"));
+  if((clean.log||[]).length > LOG_MAX + 20) trimLog(id);
+  render();
+}
+async function trimLog(id){
+  try{
+    await fb.runTransaction(fdb, async tx => {
+      const ref = fb.doc(fdb, "lots", id); const d = await tx.get(ref); if(!d.exists()) return;
+      const log = d.data().log || []; if(log.length > LOG_MAX) tx.update(ref, {log: log.slice(-LOG_MAX)});
+    });
+  }catch{}
+}
 async function removeLot(id){
   delete lots[id];
   if(mode==="shared"){ fb.deleteDoc(fb.doc(fdb, "lots", id)).catch(()=>toast("削除できませんでした")); }
@@ -127,7 +162,7 @@ function recordSale(rec){
   if(mode === "shared"){
     fb.setDoc(fb.doc(fb.collection(fdb, "sales")), rec).catch(e => toast(e && e.code==="permission-denied" ? "売上を保存できません。Firestore のルールを更新してください" : "売上を保存できませんでした"));
   }else{
-    sales.push(rec); store.set(SALES_KEY, sales);
+    sales.push(rec); store.set(SALES_KEY, sales); if(lotSales.id===rec.lotId) lotSales.rows.push(rec);
   }
 }
 function subscribeSales(from){
@@ -136,8 +171,10 @@ function subscribeSales(from){
   salesLoading = true;
   unsubSales = fb.onSnapshot(fb.query(fb.collection(fdb, "sales"), fb.where("date", ">=", from)), snap => {
     const next = []; snap.forEach(d => next.push(d.data())); sales = next; salesLoading = false;
-    if(tab === "ship") render();
-  }, () => { salesLoading = false; if(tab === "ship") render(); });
+    render(); if(sheetState && sheetState.kind==="detail") renderSheet();
+  }, e => { salesLoading = false; salesFrom = null;
+    if(e && e.code==="permission-denied") showBanner("売上の明細を読み書きできません。Firestore のルールに sales の1行を足してください。");
+    render(); });
 }
 let salesFrom = null;
 function ensureSales(){
@@ -145,6 +182,19 @@ function ensureSales(){
   const from = periodRange().from;
   if(salesFrom && salesFrom <= from) return;
   salesFrom = from; subscribeSales(from);
+}
+
+/* 商品ごとの累計（売上の明細から数えるので、記録が多くなっても正確） */
+let lotSales = {id:null, rows:[], unsub:null};
+function watchLotSales(id){
+  if(lotSales.id === id) return;
+  if(lotSales.unsub) lotSales.unsub();
+  lotSales = {id, rows:[], unsub:null};
+  if(mode !== "shared"){ lotSales.rows = sales.filter(x => x.lotId === id); return; }
+  lotSales.unsub = fb.onSnapshot(fb.query(fb.collection(fdb, "sales"), fb.where("lotId", "==", id)), snap => {
+    const rows = []; snap.forEach(d => rows.push(d.data())); lotSales.rows = rows;
+    if(sheetState && sheetState.kind==="detail" && sheetState.id===id) renderSheet();
+  }, () => {});
 }
 
 /* 写真：縮小して保存。一覧用の小さい写真は商品データに、大きい写真は photos に */
@@ -245,7 +295,8 @@ function viewToday(){
   const all = sortedLots();
   const bad = all.filter(x=>x.a.level==="bad"), warn = all.filter(x=>x.a.level==="warn");
   const t0 = new Date(); t0.setHours(0,0,0,0);
-  const salesToday = all.reduce((s,x)=>s+(x.l.log||[]).filter(e=>e.type==="sell" && new Date(e.t)>=t0).reduce((a,e)=>a+amt(e,x.l),0),0);
+  const td = today();
+  const salesToday = sales.filter(x => x.type==="sell" && x.date===td).reduce((a,x)=>a+(x.amount||0),0);
   const todo = [...bad, ...warn];
   return `
     <div><h2>${mdj(today())} の店頭</h2><p class="sub">期限が近いもの・余りそうなものから順に並べています。</p></div>
@@ -325,7 +376,7 @@ function downloadCSV(){
 
 /* ---------- シート（詳細・操作・登録） ---------- */
 function openSheet(s){ sheetState = s; renderSheet(); $("#sheet").hidden = false; $("#sheet").scrollTop = 0; document.body.style.overflow="hidden"; }
-function closeSheet(){ sheetState = null; $("#sheet").hidden = true; $("#sheet").innerHTML=""; document.body.style.overflow=""; if(tab==="new"){ tab="today"; render(); } }
+function closeSheet(){ if(lotSales.unsub){ lotSales.unsub(); } lotSales = {id:null, rows:[], unsub:null}; sheetState = null; $("#sheet").hidden = true; $("#sheet").innerHTML=""; document.body.style.overflow=""; if(tab==="new"){ tab="today"; render(); } }
 function renderSheet(){
   const s = sheetState; if(!s) return;
   const el = $("#sheet");
@@ -340,10 +391,12 @@ function sheetDetail(id, l){
   if(l.photo) loadFullPhoto(l.photo);
   const src = (l.photo && fullPhotos[l.photo]) || photoSrc(l);
   const shipped = {};
-  (l.log||[]).forEach(e => { if(e.type==="ship") shipped[e.dest] = (shipped[e.dest]||0)+e.qty; });
-  const soldAll = (l.log||[]).filter(e=>e.type==="sell").reduce((s,e)=>s+e.qty,0);
-  const soldYen = (l.log||[]).filter(e=>e.type==="sell").reduce((s,e)=>s+amt(e,l),0);
-  const shipYen = (l.log||[]).filter(e=>e.type==="ship").reduce((s,e)=>s+amt(e,l),0);
+  watchLotSales(id);
+  const mine = lotSales.id===id ? lotSales.rows : [];
+  mine.forEach(x => { if(x.type==="ship") shipped[x.channel] = (shipped[x.channel]||0)+x.qty; });
+  const soldAll = mine.filter(x=>x.type==="sell").reduce((s,x)=>s+x.qty,0);
+  const soldYen = mine.filter(x=>x.type==="sell").reduce((s,x)=>s+(x.amount||0),0);
+  const shipYen = mine.filter(x=>x.type==="ship").reduce((s,x)=>s+(x.amount||0),0);
   const LOGNAME = {sell:"売れた", restock:"店頭へ補充", ship:"出荷", discard:"廃棄", count:"店頭チェック", harvest:"入荷・収穫", create:"登録", edit:"内容を変更"};
   const logs = (l.log||[]).slice().reverse().slice(0,20);
   return `${head(l.name)}
@@ -363,7 +416,7 @@ function sheetDetail(id, l){
       <button type="button" class="act" data-act="ship">出荷する<small>${esc(a.route[a.nextStep].join("・"))} など</small></button>
       <button type="button" class="act" data-act="harvest">入荷・収穫<small>在庫を増やす</small></button>
       <button type="button" class="act" data-act="discard">廃棄<small>傷み・枯れ</small></button>
-      <button type="button" class="act" data-act="edit">内容を変更<small>期限・価格・名前</small></button>
+      <button type="button" class="act" data-act="edit">内容を変更<small>期限・価格・数の直し</small></button>
     </div>
     <div class="box"><h4>出荷ルートと実績</h4><div class="route">
       ${a.route.map((names,i)=>{ const q = i===0 ? soldAll : names.reduce((s,n)=>s+(shipped[n]||0),0);
@@ -426,9 +479,10 @@ function sheetEdit(s){
     <div class="field"><label for="fName">品名</label><input id="fName" type="text" required placeholder="例：紅はるか、玉ねぎ苗" value="${esc(l.name||"")}"></div>
     <div class="field"><span class="lbl">写真</span><div class="photo-pick"><div class="prev" id="prev">${photoSrc(l)?`<img src="${esc(photoSrc(l))}" alt="">`:"写真なし"}</div>
       <label class="file-btn">写真を撮る・選ぶ<input type="file" id="photoIn" accept="image/*" capture="environment"></label></div></div>
-    ${s.id ? "" : `<div class="two">
+    <div class="two">
       <div class="field"><label for="fShelf">店頭の数</label><input id="fShelf" type="number" inputmode="numeric" min="0" value="${l.shelf}"></div>
-      <div class="field"><label for="fStock">畑・ハウス在庫</label><input id="fStock" type="number" inputmode="numeric" min="0" value="${l.stock}"></div></div>`}
+      <div class="field"><label for="fStock">畑・ハウス在庫</label><input id="fStock" type="number" inputmode="numeric" min="0" value="${l.stock}"></div></div>
+    ${s.id ? `<span class="hint" style="margin-top:-8px">数がずれている時は、今の正しい数に直して保存してください。</span>` : ""}
     <div class="two">
       <div class="field"><label for="fUnit">単位</label><select id="fUnit">${[...new Set([...UNITS[kind], l.unit])].map(u=>`<option ${u===l.unit?"selected":""}>${esc(u)}</option>`).join("")}</select></div>
       <div class="field"><label for="fPrice">販売価格（円）</label><input id="fPrice" type="number" inputmode="numeric" min="0" value="${l.price??""}" placeholder="例：400"></div></div>
@@ -444,7 +498,9 @@ function sheetEdit(s){
 /* ---------- 操作 ---------- */
 function stamp(){ return {t:new Date().toISOString(), by: me || "未設定"}; }
 async function submitAction(s){
-  const l = JSON.parse(JSON.stringify(lots[s.id]));
+  const before = lots[s.id];
+  const l = JSON.parse(JSON.stringify(before));
+  const entries = [];
   const q = Math.max(0, Math.floor(Number($("#qty").value)||0));
   const note = $("#note").value.trim();
   const e = {...stamp(), type:s.act, qty:q}; if(note) e.note = note;
@@ -464,12 +520,12 @@ async function submitAction(s){
   if(s.act==="count"){
     const diff = (l.shelf||0) - q;
     if(s.photo){ e.mini = s.photo.mini; if(s.photo.photo) e.photo = s.photo.photo; l.photo = s.photo.photo; l.photoData = s.photo.photoData; }
-    if(diff > 0){ const se = {...stamp(), type:"sell", qty:diff, note:"店頭チェックで計算", ...(l.price!=null?{price:l.price}:{})}; l.log.push(se); recordSale(saleRecord(s.id, l, se)); }
+    if(diff > 0){ const se = {...stamp(), type:"sell", qty:diff, note:"店頭チェックで計算", ...(l.price!=null?{price:l.price}:{})}; l.log.push(se); entries.push(se); recordSale(saleRecord(s.id, l, se)); }
     l.shelf = q;
   }
-  l.log.push(e); l.updatedAt = e.t; l.updatedBy = e.by;
+  l.log.push(e); entries.push(e); l.updatedAt = e.t; l.updatedBy = e.by;
   if(s.act==="sell" || s.act==="ship") recordSale(saleRecord(s.id, l, e));
-  await saveLot(s.id, l);
+  await patchLot(s.id, before, l, entries, {absShelf: s.act==="count"});
   toast({sell:`${q}${unit} 売れたと記録しました`, restock:`${q}${unit} 店頭へ補充しました`, ship:`${s.dest} へ ${q}${unit} 出荷しました`, harvest:`${q}${unit} 在庫に足しました`, discard:`${q}${unit} の廃棄を記録しました`, count:`店頭 ${q}${unit} で保存しました`}[s.act]);
   return true;
 }
@@ -479,12 +535,15 @@ async function submitEdit(s){
   base.name = name; base.kind = s.kindSel; base.unit = $("#fUnit").value;
   const p = $("#fPrice").value; base.price = p===""?null:Math.max(0,Number(p));
   base.shelfLimit = $("#fLimit").value || null; base.memo = $("#fMemo").value.trim();
-  if(!s.id){ base.shelf = Math.max(0, Math.floor(Number($("#fShelf").value)||0)); base.stock = Math.max(0, Math.floor(Number($("#fStock").value)||0)); }
+  const nShelf = Math.max(0, Math.floor(Number($("#fShelf").value)||0)), nStock = Math.max(0, Math.floor(Number($("#fStock").value)||0));
+  const fixShelf = !s.id || nShelf !== (base.shelf||0), fixStock = !s.id || nStock !== (base.stock||0);
+  base.shelf = nShelf; base.stock = nStock;
   if(s.photo){ base.photo = s.photo.photo; base.photoData = s.photo.photoData; }
   const e = {...stamp(), type: s.id?"edit":"create", qty:0};
+  if(s.id && (fixShelf || fixStock)) e.note = `数を直した（店頭${nShelf}・在庫${nStock}）`;
   base.log = base.log || []; base.log.push(e); base.updatedAt = e.t; base.updatedBy = e.by;
   const id = s.id || newId();
-  await saveLot(id, base);
+  if(s.id) await patchLot(id, lots[s.id], base, [e], {absShelf: fixShelf, absStock: fixStock}); else await saveLot(id, base);
   toast(s.id ? "変更を保存しました" : `「${name}」を登録しました`);
   return id;
 }
