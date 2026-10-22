@@ -171,3 +171,8 @@ textarea{min-height:70px;resize:vertical}
 .name-chip{display:inline-flex;align-items:stretch}
 .choice .name-chip button[data-pick]{border-radius:999px 0 0 999px;border-right:0}
 .choice .name-chip .unpick{border-radius:0 999px 999px 0;padding:9px 12px;color:var(--muted);font-weight:700}
+
+.sale-row{width:100%;background:transparent;border:0;border-bottom:1px solid var(--line);text-align:left;padding:8px 0;color:inherit}
+.sale-row:last-child{border-bottom:0}
+.sale-row.voided .what,.sale-row.voided .num{opacity:.5;text-decoration:line-through}
+.sale-row .pill{padding:0 6px;font-size:11px;text-decoration:none}
